@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WhyAI</title>
+</head>
+<body>
+
+<textarea id="text" rows="15" cols="80" placeholder="Paste at least ~40 words here..."></textarea>
+<br>
+<button id="detect">Detect AI</button>
+<p id="result">No result yet.</p>
+
+<script type="module">
+import { pipeline } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0";
+
+const MODEL = "onnx-community/tmr-ai-text-detector-ONNX";
+const textEl = document.getElementById("text");
+const detectBtn = document.getElementById("detect");
+const resultEl = document.getElementById("result");
+
+let detector = null;
+
+function makeChunks(text) {
+  const sentences = text
+    .replace(/\s+/g, " ")
+    .match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [text];
+
+  const chunks = [];
+  let current = "";
+
+  for (const sentence of sentences) {
+    const candidate = current ? current + " " + sentence : sentence;
+    if (candidate.split(/\s+/).length > 330 && current) {
+      chunks.push(current.trim());
+      current = sentence;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current.trim()) chunks.push(current.trim());
+  return chunks;
+}
+
+async function loadModel() {
+  if (detector) return detector;
+  resultEl.textContent = "Loading model (first load can take a while)...";
+  detectBtn.disabled = true;
+  detector = await pipeline("text-classification", MODEL, { dtype: "q4" });
+  detectBtn.disabled = false;
+  return detector;
+}
+
+function getAiScore(outputs) {
+  const ai = outputs.find(x => /ai|generated|machine/i.test(String(x.label)));
+  if (ai) return ai.score;
+
+  const human = outputs.find(x => /human|real/i.test(String(x.label)));
+  if (human) return 1 - human.score;
+
+  return outputs.length > 1 ? Math.max(...outputs.map(x => x.score)) : outputs[0].score;
+}
+
+detectBtn.onclick = async () => {
+  const text = textEl.value.trim();
+
+  if (!text) {
+    alert("Paste some text first.");
+    return;
+  }
+
+  if (text.split(/\s+/).length < 40) {
+    alert("Use at least ~40 words for a meaningful result.");
+    return;
+  }
+
+  detectBtn.disabled = true;
+  resultEl.textContent = "Analyzing...";
+
+  try {
+    const model = await loadModel();
+    const chunks = makeChunks(text);
+
+    let weightedAi = 0;
+    let totalWeight = 0;
+
+    for (let i = 0; i < chunks.length; i++) {
+      resultEl.textContent = `Analyzing chunk ${i + 1} of ${chunks.length}...`;
+      const output = await model(chunks[i], { topk: 2 });
+      const ai = getAiScore(output);
+      const weight = Math.max(1, chunks[i].split(/\s+/).length);
+      weightedAi += ai * weight;
+      totalWeight += weight;
+    }
+
+    const aiScore = Math.max(0, Math.min(1, weightedAi / totalWeight));
+    const pct = Math.round(aiScore * 100);
+
+    let label;
+    if (pct >= 75) label = "Likely AI-generated";
+    else if (pct >= 50) label = "More likely AI";
+    else if (pct >= 30) label = "Uncertain";
+    else label = "Likely human-written";
+
+    resultEl.textContent = `${label} (${pct}% AI signal, ${chunks.length} chunk(s) analyzed)`;
+  } catch (err) {
+    console.error(err);
+    resultEl.textContent = "Detection failed: " + String(err?.message || err);
+  } finally {
+    detectBtn.disabled = false;
+  }
+};
+</script>
+</body>
+</html>
