@@ -8,6 +8,14 @@
 
 <textarea id="text" rows="15" cols="80" placeholder="Paste at least ~40 words here..."></textarea>
 <br>
+<label for="modelSize">Model size:</label>
+<select id="modelSize">
+  <option value="q4">Smallest (q4, fastest, lowest accuracy)</option>
+  <option value="q8">Small (q8)</option>
+  <option value="fp16" selected>Medium (fp16, GPU recommended)</option>
+  <option value="fp32">Largest (fp32, most accurate, slowest)</option>
+</select>
+<br>
 <button id="detect">Detect AI</button>
 <p id="result">No result yet.</p>
 
@@ -18,8 +26,18 @@ const MODEL = "onnx-community/tmr-ai-text-detector-ONNX";
 const textEl = document.getElementById("text");
 const detectBtn = document.getElementById("detect");
 const resultEl = document.getElementById("result");
+const modelSizeEl = document.getElementById("modelSize");
 
 let detector = null;
+let deviceUsed = "wasm";
+let loadedSize = null;
+
+modelSizeEl.addEventListener("change", () => {
+  if (modelSizeEl.value !== loadedSize) {
+    detector = null;
+    resultEl.textContent = "Model size changed. It will reload on next detect.";
+  }
+});
 
 function makeChunks(text) {
   const sentences = text
@@ -43,10 +61,54 @@ function makeChunks(text) {
 }
 
 async function loadModel() {
-  if (detector) return detector;
-  resultEl.textContent = "Loading model (first load can take a while)...";
+  const size = modelSizeEl.value; // q4, q8, fp16, fp32
+  if (detector && loadedSize === size) return detector;
+
   detectBtn.disabled = true;
-  detector = await pipeline("text-classification", MODEL, { dtype: "q4" });
+
+  const hasWebGPU = "gpu" in navigator;
+
+  if (hasWebGPU) {
+    try {
+      resultEl.textContent = `Loading ${size} model on GPU (WebGPU)... this can take a while on first run.`;
+      console.log(`Attempting WebGPU load with dtype=${size}...`);
+
+      const timeoutMs = 45000;
+      const loadPromise = pipeline("text-classification", MODEL, {
+        device: "webgpu",
+        dtype: size,
+        progress_callback: (p) => {
+          if (p && p.status) console.log("WebGPU load progress:", p);
+        },
+      });
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("WebGPU load timed out after 45s")), timeoutMs)
+      );
+
+      detector = await Promise.race([loadPromise, timeoutPromise]);
+      deviceUsed = "webgpu";
+      loadedSize = size;
+      console.log("WebGPU load succeeded.");
+    } catch (err) {
+      console.warn("WebGPU load failed, falling back to CPU:", err);
+      resultEl.textContent = "GPU load failed/timed out, falling back to CPU...";
+      detector = null;
+    }
+  }
+
+  if (!detector) {
+    resultEl.textContent = `Loading ${size} model on CPU (WASM)...`;
+    detector = await pipeline("text-classification", MODEL, {
+      device: "wasm",
+      dtype: size,
+      progress_callback: (p) => {
+        if (p && p.status) console.log("WASM load progress:", p);
+      },
+    });
+    deviceUsed = "wasm";
+    loadedSize = size;
+  }
+
   detectBtn.disabled = false;
   return detector;
 }
@@ -75,6 +137,7 @@ detectBtn.onclick = async () => {
   }
 
   detectBtn.disabled = true;
+  modelSizeEl.disabled = true;
   resultEl.textContent = "Analyzing...";
 
   try {
@@ -85,7 +148,7 @@ detectBtn.onclick = async () => {
     let totalWeight = 0;
 
     for (let i = 0; i < chunks.length; i++) {
-      resultEl.textContent = `Analyzing chunk ${i + 1} of ${chunks.length}...`;
+      resultEl.textContent = `Analyzing chunk ${i + 1} of ${chunks.length} (${deviceUsed})...`;
       const output = await model(chunks[i], { topk: 2 });
       const ai = getAiScore(output);
       const weight = Math.max(1, chunks[i].split(/\s+/).length);
@@ -102,12 +165,13 @@ detectBtn.onclick = async () => {
     else if (pct >= 30) label = "Uncertain";
     else label = "Likely human-written";
 
-    resultEl.textContent = `${label} (${pct}% AI signal, ${chunks.length} chunk(s) analyzed)`;
+    resultEl.textContent = `${label} (${pct}% AI signal, ${chunks.length} chunk(s), ran on ${deviceUsed})`;
   } catch (err) {
     console.error(err);
     resultEl.textContent = "Detection failed: " + String(err?.message || err);
   } finally {
     detectBtn.disabled = false;
+    modelSizeEl.disabled = false;
   }
 };
 </script>
